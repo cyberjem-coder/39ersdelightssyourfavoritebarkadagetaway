@@ -62,14 +62,16 @@ async function withStorageRetry(operationName, operation) {
   throw lastError;
 }
 
-async function handleRequest(request) {
+async function handleRequest(request, setStage) {
   if (request.method === "GET") {
+    setStage("menu_storage_read");
     const saved = await withStorageRetry("menu read", () => store.get("customer-menu", { type: "json" }));
     return json({ ok: true, menu: Array.isArray(saved?.menu) ? saved.menu : [], updatedAt: saved?.updatedAt ?? null });
   }
 
   if (request.method === "PUT") {
-    // Authorization itself reads/writes Blobs; retry it separately from the menu write.
+    // Authorization itself reads/writes Blobs; keep its failure distinct from the menu write.
+    setStage("cashier_authorization_storage");
     const authorized = await withStorageRetry("cashier authorization", () =>
       verifyStoreKey(request, { registerIfMissing: true })
     );
@@ -93,6 +95,7 @@ async function handleRequest(request) {
     const updatedAt = new Date().toISOString();
     const snapshot = { menu, updatedAt };
     // This is an overwrite of one fixed key, so retrying the identical snapshot is safe.
+    setStage("menu_storage_write");
     const saved = await withStorageRetry("menu write", () => store.setJSON("customer-menu", snapshot));
     return json({ ok: true, count: menu.length, updatedAt, modified: saved?.modified ?? true });
   }
@@ -100,18 +103,39 @@ async function handleRequest(request) {
   return json({ ok: false, message: "Method not allowed." }, 405, { Allow: "GET, PUT" });
 }
 
+function safeDiagnostic(error, stage) {
+  const providerStatus = getErrorStatus(error);
+  const rawCode = String(error?.code ?? error?.cause?.code ?? "");
+  const errorCode = /^[A-Za-z0-9_:-]{1,48}$/.test(rawCode) ? rawCode : null;
+  const rawName = String(error?.name ?? "Error");
+  const errorType = /^[A-Za-z][A-Za-z0-9_]{0,48}$/.test(rawName) ? rawName : "Error";
+  return {
+    stage,
+    errorType,
+    errorCode,
+    providerStatus: providerStatus > 0 && providerStatus < 600 ? providerStatus : null,
+  };
+}
+
 export default async function handler(request) {
+  let failureStage = "request_handling";
   try {
-    return await handleRequest(request);
+    return await handleRequest(request, stage => { failureStage = stage; });
   } catch (error) {
     const incidentId = `menu-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
-    console.error(`[mobile-menu] ${incidentId} ${request.method} failed`, error?.stack || error);
+    const diagnostic = safeDiagnostic(error, failureStage);
+    console.error(`[mobile-menu] ${incidentId} ${request.method} failed at ${failureStage}`, error?.stack || error);
     return json({
       ok: false,
       code: "MENU_SERVICE_TEMPORARILY_UNAVAILABLE",
       message: "Netlify could not publish or load the menu right now. Please try again in a moment.",
       incidentId,
-    }, 503, { "Retry-After": "2", "X-Menu-Incident-Id": incidentId });
+      diagnostic,
+    }, 503, {
+      "Retry-After": "2",
+      "X-Menu-Incident-Id": incidentId,
+      "X-Menu-Diagnostic-Stage": failureStage,
+    });
   }
 }
 
